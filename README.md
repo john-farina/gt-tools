@@ -1,6 +1,6 @@
 # gt-tools
 
-CLI tools for [Graphite](https://graphite.dev) stacked PRs — because merge conflicts at 2am are not a personality trait.
+CLI tools for [Graphite](https://graphite.dev) stacked PRs.
 
 ---
 
