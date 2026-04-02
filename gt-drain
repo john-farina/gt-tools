@@ -1,0 +1,755 @@
+#!/opt/homebrew/bin/bash
+set -uo pipefail
+
+# gt-drain: Merge a Graphite stack bottom-up, one PR at a time.
+#
+# Usage:
+#   gt-drain                    # Merges current branch (must have a PR)
+#   gt-drain branch1 branch2    # Merges specific branches in order given
+#   gt-drain --prep             # Just sync/restack/submit (no merge)
+#   gt-drain --status           # Show merge status of current "(merging)" branches
+#   gt-drain --no-wait          # Enqueue all PRs but don't wait for merges
+#   gt-drain --continue         # Resume after resolving a restack conflict
+#   gt-drain --no-squash        # Skip squashing multi-commit branches before restack
+#
+# Safety features:
+#   - Snapshots every branch's diff + SHA before restacking
+#   - Verifies no changes were lost after restack
+#   - Aborts automatically if drift detected (use --force to override)
+#   - Snapshots saved to ~/.gt-drain/snapshots/ for recovery via gt-rescue
+#
+# This avoids the merge queue conflict cascade that happens when you
+# enqueue multiple PRs from a deep stack at once.
+
+REPO=$(gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null || echo "")
+POLL_INTERVAL=90  # seconds between merge status checks
+SNAPSHOT_DIR="$HOME/.gt-drain/snapshots"
+SQUASH_BEFORE_RESTACK=true
+FORCE_MODE=false
+NO_WAIT=false
+CONTINUE_MODE=false
+CURRENT_SNAPSHOT_FILE="$HOME/.gt-drain/current-snapshot"
+CURRENT_BRANCHES_FILE="$HOME/.gt-drain/current-branches"
+CURRENT_INDEX_FILE="$HOME/.gt-drain/current-index"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+log()  { echo -e "${BLUE}[gt-drain]${NC} $1"; }
+ok()   { echo -e "${GREEN}[gt-drain]${NC} $1"; }
+warn() { echo -e "${YELLOW}[gt-drain]${NC} $1"; }
+err()  { echo -e "${RED}[gt-drain]${NC} $1"; }
+snap() { echo -e "${CYAN}[snapshot]${NC} $1"; }
+
+# ─── Version + update check ──────────────────────────────────────
+GT_DRAIN_VERSION="1.0.0"
+_GT_DRAIN_UPDATE_FILE="${TMPDIR:-/tmp}/.gt-drain-update-check"
+
+_check_for_update() {
+    (
+        # Only check once per 24 hours
+        if [[ -f "$_GT_DRAIN_UPDATE_FILE" ]]; then
+            local last_check now
+            last_check=$(stat -f %m "$_GT_DRAIN_UPDATE_FILE" 2>/dev/null || echo 0)
+            now=$(date +%s)
+            if (( now - last_check < 86400 )); then
+                return
+            fi
+        fi
+        local latest
+        latest=$(curl -fsS --max-time 2 \
+            "https://api.github.com/repos/john-farina/gt-tools/releases/latest" \
+            2>/dev/null | grep '"tag_name"' | sed 's/.*"tag_name": *"v\?//;s/".*//')
+        [[ -z "$latest" ]] && return
+        _semver_gt() {
+            local IFS=. a=($1) b=($2) i
+            for i in 0 1 2; do
+                (( ${a[$i]:-0} > ${b[$i]:-0} )) && return 0
+                (( ${a[$i]:-0} < ${b[$i]:-0} )) && return 1
+            done
+            return 1
+        }
+        if _semver_gt "$latest" "$GT_DRAIN_VERSION"; then
+            printf '%b\n' "${YELLOW}[gt-drain]${NC} Update available: v${GT_DRAIN_VERSION} → v${latest}   brew upgrade john-farina/gt-tools/gt-drain" \
+                > "$_GT_DRAIN_UPDATE_FILE"
+        else
+            : > "$_GT_DRAIN_UPDATE_FILE"
+        fi
+        touch "$_GT_DRAIN_UPDATE_FILE"
+    ) &
+    _GT_DRAIN_UPDATE_PID=$!
+}
+
+_print_update_notice() {
+    wait "${_GT_DRAIN_UPDATE_PID:-}" 2>/dev/null || true
+    [[ -s "$_GT_DRAIN_UPDATE_FILE" ]] && printf '%b\n' "$(cat "$_GT_DRAIN_UPDATE_FILE")"
+}
+
+trap '_print_update_notice' EXIT
+_check_for_update
+# ─────────────────────────────────────────────────────────────────
+
+# ─── Snapshot: capture every branch's state before restack ───────
+capture_snapshot() {
+    local snapshot_id
+    snapshot_id=$(date +%Y%m%d-%H%M%S)
+    local snapshot_path="$SNAPSHOT_DIR/$snapshot_id"
+    mkdir -p "$snapshot_path"
+
+    {
+    snap "Capturing stack snapshot → ${snapshot_id}"
+
+    # Save metadata
+    cat > "$snapshot_path/manifest.json" <<MANIFEST
+{
+  "id": "$snapshot_id",
+  "repo": "$REPO",
+  "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+  "cwd": "$(pwd)",
+  "original_branch": "$(git branch --show-current)"
+}
+MANIFEST
+
+    # Get all branches in the stack (bottom to top)
+    local current_branch
+    current_branch=$(git branch --show-current)
+    gt bottom 2>/dev/null || true
+    local branches=()
+    while true; do
+        branches+=("$(git branch --show-current)")
+        gt up 2>/dev/null || break
+    done
+
+    local branch_list=""
+    for branch in "${branches[@]}"; do
+        gt checkout "$branch" 2>/dev/null
+
+        local branch_dir="$snapshot_path/$branch"
+        mkdir -p "$branch_dir"
+
+        # Save the commit SHA
+        git rev-parse HEAD > "$branch_dir/sha.txt"
+
+        # Save the parent SHA (not branch name — branch may be deleted after merge)
+        local parent_branch
+        parent_branch=$(gt parent 2>/dev/null || echo "main")
+        local parent_sha
+        parent_sha=$(git rev-parse "${parent_branch}" 2>/dev/null || git rev-parse "main")
+        echo "$parent_sha" > "$branch_dir/parent.txt"
+
+        # Save commit count (relative to parent SHA)
+        local commit_count
+        commit_count=$(git log --oneline "${parent_sha}".."$branch" 2>/dev/null | wc -l | tr -d ' ')
+        echo "$commit_count" > "$branch_dir/commit_count.txt"
+
+        # Save the diff (this branch's unique contribution) using HEAD~N for stability
+        if [[ "$commit_count" -eq 1 ]]; then
+            git show HEAD > "$branch_dir/diff.patch" 2>/dev/null || true
+        elif [[ "$commit_count" -gt 1 ]]; then
+            git diff "HEAD~${commit_count}..HEAD" > "$branch_dir/diff.patch" 2>/dev/null || true
+        else
+            touch "$branch_dir/diff.patch"
+        fi
+
+        # Save file list and stats
+        git diff --name-only "HEAD~${commit_count}..HEAD" > "$branch_dir/files.txt" 2>/dev/null || true
+        git diff --stat "HEAD~${commit_count}..HEAD" > "$branch_dir/stats.txt" 2>/dev/null || true
+
+        # Save full commit log
+        git log --oneline "${parent_sha}".."$branch" > "$branch_dir/log.txt" 2>/dev/null || true
+
+        local file_count
+        file_count=$(wc -l < "$branch_dir/files.txt" | tr -d ' ')
+        local diff_size
+        diff_size=$(wc -c < "$branch_dir/diff.patch" | tr -d ' ')
+        snap "  ${branch}: ${commit_count} commits, ${file_count} files, ${diff_size} bytes"
+
+        branch_list="${branch_list}${branch}\n"
+    done
+
+    # Save branch order
+    printf "%b" "$branch_list" > "$snapshot_path/branches.txt"
+
+    # Return to original branch
+    gt checkout "$current_branch" 2>/dev/null || true
+
+    snap "Snapshot saved → ~/.gt-drain/snapshots/${snapshot_id}"
+    } >&2
+    echo "$snapshot_id"
+}
+
+# ─── Verify: compare post-restack state against snapshot ─────────
+verify_snapshot() {
+    local snapshot_id="$1"
+    local snapshot_path="$SNAPSHOT_DIR/$snapshot_id"
+    local drift_found=false
+
+    snap "Verifying stack integrity against snapshot ${snapshot_id}..."
+
+    local current_branch
+    current_branch=$(git branch --show-current)
+
+    while IFS= read -r branch; do
+        [[ -z "$branch" ]] && continue
+        local branch_dir="$snapshot_path/$branch"
+        [[ ! -d "$branch_dir" ]] && continue
+
+        gt checkout "$branch" 2>/dev/null || continue
+
+        local old_files new_files old_diff_size new_diff_size
+
+        old_files=$(cat "$branch_dir/files.txt" 2>/dev/null | sort)
+        old_diff_size=$(wc -c < "$branch_dir/diff.patch" 2>/dev/null | tr -d ' ')
+
+        # Use saved commit count (HEAD~N is stable across rebases, parent SHA is not)
+        local commit_count
+        commit_count=$(cat "$branch_dir/commit_count.txt" 2>/dev/null || echo "0")
+        local tmp_files="/tmp/gt-drain-verify-files-$$"
+        local tmp_diff="/tmp/gt-drain-verify-diff-$$"
+
+        if [[ "$commit_count" -gt 0 ]]; then
+            git diff --name-only "HEAD~${commit_count}..HEAD" 2>/dev/null | sort > "$tmp_files" || true
+            if [[ "$commit_count" -eq 1 ]]; then
+                git show HEAD > "$tmp_diff" 2>/dev/null || true
+            else
+                git diff "HEAD~${commit_count}..HEAD" > "$tmp_diff" 2>/dev/null || true
+            fi
+        else
+            touch "$tmp_files" "$tmp_diff"
+        fi
+
+        new_files=$(cat "$tmp_files" 2>/dev/null)
+        new_diff_size=$(wc -c < "$tmp_diff" 2>/dev/null | tr -d ' ')
+
+        # Check for missing files (files in old diff but not in new diff)
+        local missing_files
+        missing_files=$(comm -23 <(echo "$old_files") <(echo "$new_files") 2>/dev/null || true)
+
+        if [[ -n "$missing_files" ]]; then
+            err "  ${branch}: DRIFT — files LOST after restack:"
+            echo "$missing_files" | while IFS= read -r f; do
+                err "    - $f"
+            done
+            drift_found=true
+        fi
+
+        # Check for significant diff size drop (>20% smaller = suspicious)
+        if [[ "$old_diff_size" -gt 100 && "$new_diff_size" -gt 0 ]]; then
+            local ratio=$(( (new_diff_size * 100) / old_diff_size ))
+            if [[ "$ratio" -lt 80 ]]; then
+                warn "  ${branch}: diff shrank ${old_diff_size}b → ${new_diff_size}b (${ratio}% of original)"
+                drift_found=true
+            else
+                ok "  ${branch}: ✓ (${ratio}% match)"
+            fi
+        elif [[ "$old_diff_size" -gt 100 && "$new_diff_size" -eq 0 ]]; then
+            err "  ${branch}: DRIFT — diff is EMPTY after restack (was ${old_diff_size}b)"
+            drift_found=true
+        else
+            ok "  ${branch}: ✓"
+        fi
+
+        rm -f "$tmp_files" "$tmp_diff"
+    done < "$snapshot_path/branches.txt"
+
+    gt checkout "$current_branch" 2>/dev/null || true
+
+    if [[ "$drift_found" == "true" ]]; then
+        echo ""
+        err "━━━ DRIFT DETECTED ━━━"
+        err "The restack may have lost changes."
+        err "Snapshot: ${snapshot_id}"
+        err ""
+        err "To recover:  gt-rescue restore ${snapshot_id}"
+        err "To inspect:  gt-rescue show ${snapshot_id}"
+        err "To diff:     gt-rescue diff ${snapshot_id}"
+
+        if [[ "$FORCE_MODE" == "true" ]]; then
+            warn "Continuing anyway (--force mode)"
+            return 0
+        else
+            err ""
+            err "Aborting. Use --force to continue despite drift."
+            return 1
+        fi
+    else
+        ok "All branches verified — no drift detected."
+        return 0
+    fi
+}
+
+# ─── Squash multi-commit branches before restack ─────────────────
+squash_multi_commit_branches() {
+    local current_branch
+    current_branch=$(git branch --show-current)
+
+    gt bottom 2>/dev/null || true
+    while true; do
+        local branch
+        branch=$(git branch --show-current)
+        local parent
+        parent=$(gt parent 2>/dev/null || echo "main")
+        local commit_count
+        commit_count=$(git log --oneline "$parent".."$branch" 2>/dev/null | wc -l | tr -d ' ')
+
+        if [[ "$commit_count" -gt 1 ]]; then
+            log "Squashing ${branch} (${commit_count} commits → 1)..."
+            GIT_EDITOR=true gt squash --no-interactive 2>/dev/null || true
+            # Re-sync Graphite's tracking after squash rewrites the SHA
+            gt track --force 2>/dev/null || true
+        fi
+
+        gt up 2>/dev/null || break
+    done
+
+    gt checkout "$current_branch" 2>/dev/null || true
+}
+
+# ─── Restack + verify + submit (shared by do_prep and --continue) ─
+do_restack_and_submit() {
+    local snapshot_id="$1"
+
+    # Restack
+    log "Restacking..."
+    set +e
+    gt restack --no-interactive 2>&1
+    local restack_exit=$?
+    set -e
+    if [[ $restack_exit -ne 0 ]]; then
+        local conflict_file
+        conflict_file=$(git diff --name-only --diff-filter=U 2>/dev/null | head -1)
+        err ""
+        err "━━━ RESTACK CONFLICT ━━━"
+        err "gt restack hit a merge conflict and stopped."
+        if [[ -n "$conflict_file" ]]; then
+            err "Conflicting file: $conflict_file"
+        fi
+        err ""
+        err "To fix:"
+        err "  1. Resolve the conflict markers in the file(s) above"
+        err "  2. gt add <file>        (mark each resolved file)"
+        err "  3. gt continue          (resumes the rebase)"
+        err "  4. gt-drain --continue  (picks up right where you left off)"
+        err ""
+        err "Your pre-conflict snapshot: ${snapshot_id}"
+        err "To restore if something went wrong: gt-rescue restore ${snapshot_id}"
+        exit 1
+    fi
+    echo ""
+
+    # Verify nothing was lost
+    if ! verify_snapshot "$snapshot_id"; then
+        exit 1
+    fi
+    echo ""
+
+    # Submit (with auto-recovery for common failures)
+    log "Submitting all branches..."
+    local submit_exit=0
+    local submit_attempt=0
+    local max_attempts=3
+    while (( submit_attempt < max_attempts )); do
+        submit_attempt=$(( submit_attempt + 1 ))
+        local tmp_out
+        tmp_out=$(mktemp)
+        set +e
+        gt submit --stack --no-edit --no-interactive --force 2>&1 | tee "$tmp_out"
+        submit_exit=${PIPESTATUS[0]}
+        set -e
+        local submit_output
+        submit_output=$(cat "$tmp_out")
+        rm -f "$tmp_out"
+
+        [[ $submit_exit -eq 0 ]] && break
+
+        if echo "$submit_output" | grep -q "already been merged or closed\|merged commits are not contained"; then
+            warn ""
+            warn "Merged branches still in stack — running gt sync to clean up, then retrying..."
+            set +e; gt sync --no-interactive 2>&1; set -e
+        elif echo "$submit_output" | grep -q "updated remotely outside of Graphite"; then
+            warn ""
+            warn "Branch updated remotely — running gt get to sync, then retrying..."
+            set +e; gt get 2>&1; set -e
+        else
+            break  # Unknown error — don't retry
+        fi
+    done
+
+    if [[ $submit_exit -ne 0 ]]; then
+        err ""
+        err "━━━ SUBMIT FAILED ━━━"
+        err "Run 'gt submit --stack' manually to see the full error, then re-run gt-drain --continue."
+        err "Snapshot: ${snapshot_id}  (restore with: gt-rescue restore ${snapshot_id})"
+        exit 1
+    fi
+    ok "Stack prepped and submitted."
+    ok "Snapshot: ${snapshot_id}"
+}
+
+# ─── Prep: snapshot + squash + sync + restack + verify + submit ──
+do_prep() {
+    # 1. Capture snapshot before any destructive ops
+    local snapshot_id
+    snapshot_id=$(capture_snapshot)
+    echo ""
+
+    # Persist snapshot so --continue can reference it
+    mkdir -p "$(dirname "$CURRENT_SNAPSHOT_FILE")"
+    echo "$snapshot_id" > "$CURRENT_SNAPSHOT_FILE"
+
+    # 2. Squash multi-commit branches to reduce rebase risk
+    if [[ "$SQUASH_BEFORE_RESTACK" == "true" ]]; then
+        log "Squashing multi-commit branches..."
+        squash_multi_commit_branches
+        echo ""
+    fi
+
+    # 3. Sync with trunk
+    log "Syncing with trunk..."
+    set +e
+    gt sync --no-interactive 2>&1
+    set -e
+
+    # 4. Restack + verify + submit
+    do_restack_and_submit "$snapshot_id"
+}
+
+# ─── Continue: resume after a restack conflict was resolved ──────
+do_continue() {
+    if [[ ! -f "$CURRENT_SNAPSHOT_FILE" || ! -f "$CURRENT_BRANCHES_FILE" ]]; then
+        err "No in-progress drain found. Run 'gt-drain <branch>' to start a new drain."
+        exit 1
+    fi
+
+    local snapshot_id
+    snapshot_id=$(cat "$CURRENT_SNAPSHOT_FILE")
+    local saved_i
+    saved_i=$(cat "$CURRENT_INDEX_FILE" 2>/dev/null || echo "0")
+
+    # Read saved branch list
+    local all_branches=()
+    while IFS= read -r b; do
+        [[ -n "$b" ]] && all_branches+=("$b")
+    done < "$CURRENT_BRANCHES_FILE"
+
+    log "Resuming drain with snapshot: ${snapshot_id}"
+    log "Branches: ${all_branches[*]}"
+    echo ""
+
+    # Complete the restack + verify + submit that was interrupted
+    do_restack_and_submit "$snapshot_id"
+    echo ""
+
+    # Resume the merge loop from where we left off
+    local remaining=("${all_branches[@]:$saved_i}")
+    if [[ ${#remaining[@]} -gt 0 ]]; then
+        run_merge_loop "${remaining[@]}"
+    else
+        ok "All branches already processed."
+        rm -f "$CURRENT_SNAPSHOT_FILE" "$CURRENT_BRANCHES_FILE" "$CURRENT_INDEX_FILE"
+    fi
+}
+
+# ─── Get PR number for a branch ──────────────────────────────────
+get_pr_number() {
+    local branch="$1"
+    gh pr view "$branch" --repo "$REPO" --json number -q '.number' 2>/dev/null || echo ""
+}
+
+# ─── Check if a PR is merged ─────────────────────────────────────
+is_merged() {
+    local pr_num="$1"
+    local state
+    state=$(gh pr view "$pr_num" --repo "$REPO" --json state -q '.state' 2>/dev/null)
+    [[ "$state" == "MERGED" ]]
+}
+
+# ─── Check if a PR is in merge queue ─────────────────────────────
+is_in_queue() {
+    local pr_num="$1"
+    local labels
+    labels=$(gh pr view "$pr_num" --repo "$REPO" --json labels -q '.labels[].name' 2>/dev/null)
+    echo "$labels" | grep -qi "merge" 2>/dev/null
+}
+
+# ─── Check if a PR is open, approved, and not draft ─────────────
+is_pr_ready() {
+    local pr_num="$1"
+    local info
+    info=$(gh pr view "$pr_num" --repo "$REPO" --json state,isDraft,reviewDecision 2>/dev/null)
+    local state isDraft reviewDecision
+    state=$(echo "$info" | grep -o '"state":"[^"]*"' | cut -d'"' -f4)
+    isDraft=$(echo "$info" | grep -o '"isDraft":[^,}]*' | cut -d: -f2 | tr -d ' ')
+    reviewDecision=$(echo "$info" | grep -o '"reviewDecision":"[^"]*"' | cut -d'"' -f4)
+    [[ "$state" == "OPEN" && "$isDraft" == "false" && "$reviewDecision" == "APPROVED" ]]
+}
+
+# ─── Wait for a PR to merge ──────────────────────────────────────
+wait_for_merge() {
+    local branch="$1"
+    local pr_num="$2"
+    local elapsed=0
+    local max_wait=1800  # 30 min timeout
+
+    log "Waiting for PR #${pr_num} (${branch}) to merge..."
+    log "Checking every ${POLL_INTERVAL}s (timeout: ${max_wait}s)"
+    echo ""
+
+    while true; do
+        if is_merged "$pr_num"; then
+            ok "PR #${pr_num} (${branch}) merged!"
+            return 0
+        fi
+
+        if (( elapsed >= max_wait )); then
+            err ""
+            err "━━━ MERGE TIMEOUT ━━━"
+            err "PR #${pr_num} (${branch}) hasn't merged after ${max_wait}s."
+            err "It may be stuck in the merge queue or waiting on CI."
+            err ""
+            err "Check the PR:  https://github.com/${REPO}/pull/${pr_num}"
+            err "Once merged, re-run: gt-drain ${branch}"
+            return 1
+        fi
+
+        printf "\r  ⏳ %ds elapsed... " "$elapsed"
+        sleep "$POLL_INTERVAL"
+        elapsed=$((elapsed + POLL_INTERVAL))
+    done
+}
+
+# ─── Enqueue a single PR via --merge-when-ready ──────────────────
+enqueue_one() {
+    local branch="$1"
+    log "Enqueueing ${branch} with --merge-when-ready..."
+    gt submit --branch "$branch" --no-edit --no-interactive --merge-when-ready 2>&1 | tail -5
+}
+
+# ─── Get branches currently marked "(merging)" ───────────────────
+get_merging_branches() {
+    gt log 2>&1 | grep "(merging)" | sed 's/.*◯ //' | sed 's/ (merging).*//' | tail -r
+}
+
+# ─── Show status of merging branches ─────────────────────────────
+show_status() {
+    log "Checking merge status..."
+    echo ""
+    local branches
+    branches=$(get_merging_branches)
+
+    if [[ -z "$branches" ]]; then
+        ok "No branches currently marked as merging."
+        return
+    fi
+
+    while IFS= read -r branch; do
+        local pr_num
+        pr_num=$(get_pr_number "$branch")
+        if [[ -z "$pr_num" ]]; then
+            warn "  $branch — no PR found"
+            continue
+        fi
+
+        if is_merged "$pr_num"; then
+            ok "  $branch (PR #${pr_num}) — MERGED"
+        else
+            local state
+            state=$(gh pr view "$pr_num" --repo "$REPO" --json state -q '.state' 2>/dev/null)
+            warn "  $branch (PR #${pr_num}) — $state"
+        fi
+    done <<< "$branches"
+    echo ""
+}
+
+# ─── Enqueue + wait loop (shared by drain and --continue) ────────
+run_merge_loop() {
+    local -a branches=("${@}")
+    local total=${#branches[@]}
+
+    local i=0
+    for branch in "${branches[@]}"; do
+        i=$((i + 1))
+        log "━━━ Branch $i/${total}: $branch ━━━"
+
+        local pr_num
+        pr_num=$(get_pr_number "$branch")
+        if [[ -z "$pr_num" ]]; then
+            err "No PR found for branch '$branch' — has it been submitted yet?"
+            err "Run: gt submit --branch $branch"
+            err "Then re-run: gt-drain $branch"
+            exit 1
+        fi
+
+        # Check if already merged
+        if is_merged "$pr_num"; then
+            ok "PR #${pr_num} already merged. Skipping."
+            continue
+        fi
+
+        # Only enqueue if open, approved, and not draft
+        if ! is_pr_ready "$pr_num"; then
+            local info
+            info=$(gh pr view "$pr_num" --repo "$REPO" --json state,isDraft,reviewDecision \
+                -q '"state=\(.state) draft=\(.isDraft) review=\(.reviewDecision)"' 2>/dev/null)
+            warn "PR #${pr_num} (${branch}) is not ready to merge — skipping."
+            warn "  $info"
+            warn "  Get it approved and out of draft, then re-run: gt-drain $branch"
+            continue
+        fi
+
+        # Enqueue just this one
+        enqueue_one "$branch"
+
+        if [[ "$NO_WAIT" == "true" ]]; then
+            ok "PR #${pr_num} (${branch}) enqueued — skipping wait."
+            continue
+        fi
+
+        # Wait for it to merge
+        if ! wait_for_merge "$branch" "$pr_num"; then
+            err "Failed to merge $branch. Stopping."
+            err ""
+            err "To retry from this branch:"
+            err "  gt-drain $branch ${branches[*]:$i}"
+            exit 1
+        fi
+
+        echo ""
+
+        # Prep for next branch (unless this was the last one)
+        if (( i < total )); then
+            log "Prepping for next branch..."
+            # Save index so --continue knows where to resume
+            echo "$i" > "$CURRENT_INDEX_FILE"
+            do_prep
+            echo ""
+        fi
+    done
+
+    echo ""
+    ok "━━━ All ${total} branches processed! ━━━"
+    log "Run 'gt sync' to clean up merged branches."
+
+    # Clean up all state + snapshot data on successful completion
+    local snapshot_id
+    snapshot_id=$(cat "$CURRENT_SNAPSHOT_FILE" 2>/dev/null || true)
+    if [[ -n "$snapshot_id" && -d "$SNAPSHOT_DIR/$snapshot_id" ]]; then
+        rm -rf "$SNAPSHOT_DIR/$snapshot_id"
+    fi
+    rm -f "$CURRENT_SNAPSHOT_FILE" "$CURRENT_BRANCHES_FILE" "$CURRENT_INDEX_FILE"
+    ok "Snapshot data cleared."
+}
+
+# ─── Main: drain branches one by one ─────────────────────────────
+drain() {
+    local branches=("$@")
+
+    if [[ ${#branches[@]} -eq 0 ]]; then
+        local current_branch
+        current_branch=$(git branch --show-current)
+        if [[ -n "$current_branch" ]]; then
+            local pr_num
+            pr_num=$(get_pr_number "$current_branch")
+            if [[ -n "$pr_num" ]]; then
+                log "No branch specified — using current branch: $current_branch (PR #${pr_num})"
+                branches=("$current_branch")
+            else
+                err "No branch specified and current branch '$current_branch' has no PR."
+                err "Submit it first: gt submit --branch $current_branch"
+                err "Or specify a branch: gt-drain <branch>"
+                exit 1
+            fi
+        else
+            err "Not on a branch. Specify a branch: gt-drain <branch>"
+            exit 1
+        fi
+    fi
+
+    # Sync first to prune merged branches from the stack
+    log "Syncing with trunk to clean up merged branches..."
+    set +e
+    gt sync --no-interactive 2>&1 | tail -5
+    set -e
+    echo ""
+
+    log "Will merge ${#branches[@]} branches bottom-up:"
+    for b in "${branches[@]}"; do
+        echo "  → $b"
+    done
+    echo ""
+
+    # Save state for --continue
+    mkdir -p "$(dirname "$CURRENT_BRANCHES_FILE")"
+    printf '%s\n' "${branches[@]}" > "$CURRENT_BRANCHES_FILE"
+    echo "0" > "$CURRENT_INDEX_FILE"
+
+    # Initial prep (snapshot + squash + sync + restack + verify + submit)
+    do_prep
+    echo ""
+
+    run_merge_loop "${branches[@]}"
+}
+
+# ─── CLI ──────────────────────────────────────────────────────────
+
+# Parse flags
+positional=()
+for arg in "$@"; do
+    case "$arg" in
+        --no-squash) SQUASH_BEFORE_RESTACK=false ;;
+        --no-wait) NO_WAIT=true ;;
+        --force) FORCE_MODE=true ;;
+        --continue) CONTINUE_MODE=true ;;
+        --clear-cache) positional=("--clear-cache" "${positional[@]}") ;;
+        --prep|--status|--help|-h) positional=("$arg" "${positional[@]}") ;;
+        *) positional+=("$arg") ;;
+    esac
+done
+set -- "${positional[@]+"${positional[@]}"}"
+
+if [[ "$CONTINUE_MODE" == "true" ]]; then
+    do_continue
+    exit 0
+fi
+
+case "${1:-}" in
+    --prep)
+        do_prep
+        ;;
+    --status)
+        show_status
+        ;;
+    --clear-cache)
+        log "Clearing all gt-drain state and snapshots..."
+        rm -rf "$HOME/.gt-drain"
+        ok "Cleared ~/.gt-drain"
+        ;;
+    --help|-h)
+        echo "gt-drain: Merge a Graphite stack bottom-up, one PR at a time."
+        echo ""
+        echo "Usage:"
+        echo "  gt-drain                    Merges all '(merging)' branches in current stack"
+        echo "  gt-drain branch1 branch2    Merges specific branches in order given"
+        echo "  gt-drain --prep             Just sync/restack/submit (no merge)"
+        echo "  gt-drain --status           Show merge status of current '(merging)' branches"
+        echo ""
+        echo "Flags:"
+        echo "  --no-wait      Enqueue PRs with --merge-when-ready but don't poll for merge"
+        echo "  --continue     Resume after resolving a restack conflict"
+        echo "  --clear-cache  Remove all saved state and snapshots (~/.gt-drain)"
+        echo "  --no-squash    Skip squashing multi-commit branches before restack"
+        echo "  --force        Continue even if post-restack drift is detected"
+        echo ""
+        echo "Safety:"
+        echo "  Every run snapshots branch diffs/SHAs to ~/.gt-drain/snapshots/"
+        echo "  Use 'gt-rescue' to list, inspect, or restore from snapshots."
+        ;;
+    *)
+        drain "$@"
+        ;;
+esac
